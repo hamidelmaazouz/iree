@@ -61,6 +61,23 @@ static SmallVector<Attribute> getThreadMapping(MLIRContext *ctx) {
   return mapping;
 }
 
+/// Check if a pad value matches what hardware OOB clamping returns (zero
+/// bytes). For IEEE floats this is ±0.0. For types like f8E8M0FNU where the
+/// all-zeros bit pattern (0x00) represents 2^(-127) rather than IEEE zero,
+/// we check the bit pattern directly since gather_to_lds OOB clamping returns
+/// zero bytes regardless of the element type's semantics.
+static bool padValueMatchesHardwareOOBZero(Value padVal) {
+  if (matchPattern(padVal, m_AnyZeroFloat()) ||
+      matchPattern(padVal, m_Zero())) {
+    return true;
+  }
+  APFloat floatVal(APFloat::IEEEdouble());
+  if (matchPattern(padVal, m_ConstantFloat(&floatVal))) {
+    return floatVal.bitcastToAPInt().isZero();
+  }
+  return false;
+}
+
 /// Trace through extract_slice operations to find an underlying tensor.pad.
 /// Returns the PadOp if found, nullptr otherwise.
 static tensor::PadOp traceToTensorPad(Value source) {
@@ -453,9 +470,13 @@ static LogicalResult createDMAInForall(scf::ForallOp threadForallOp,
     // After tiling, the input is typically:
     //   tensor.extract_slice %padded[...] [...] [1, 1]
     // We need to trace through extract_slice to find if source is tensor.pad.
+    // There may be nested pads (e.g., from GPUPromoteMatmulOperands padding
+    // the Ko dimension + padCopyForDMA padding for DMA alignment). We unwrap
+    // all pad layers, accumulating in_bounds from each, to reach the original
+    // source tensor from fat_raw_buffer.
     if (tensor::PadOp pad = traceToTensorPad(input)) {
       // Verify pad constraints: low padding must be all zeros, pad value must
-      // be 0.
+      // have all-zero bit pattern (matching hardware OOB clamping).
       // TODO(#23365): Support non-zero pad values (e.g., -inf, 1) by emitting
       // a select on the loaded values from LDS to replace OOB zeros with the
       // desired padding element.
@@ -467,8 +488,7 @@ static LogicalResult createDMAInForall(scf::ForallOp threadForallOp,
         }
       }
       Value padVal = pad.getConstantPaddingValue();
-      if (!padVal || !(matchPattern(padVal, m_AnyZeroFloat()) ||
-                       matchPattern(padVal, m_Zero()))) {
+      if (!padVal || !padValueMatchesHardwareOOBZero(padVal)) {
         validPad = false;
       }
 
