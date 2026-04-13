@@ -188,47 +188,6 @@ static bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target) {
   return chipset->majorVersion == 9 && chipset->minorVersion >= 5;
 }
 
-/// Returns the subgroup size if the available elements are aligned to DMA
-/// transfer sizes, std::nullopt otherwise.
-static std::optional<int64_t>
-getDMAAlignedSubgroupSize(FunctionOpInterface funcOp, Type elementType,
-                          int64_t availableElements) {
-  std::optional<int64_t> subgroupSize = getSubgroupSize(funcOp);
-  if (!subgroupSize) {
-    return std::nullopt;
-  }
-
-  int64_t elementBits = elementType.getIntOrFloatBitWidth();
-
-  IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
-  if (!target || !targetSupportsGlobalLoadDMA(target)) {
-    return std::nullopt;
-  }
-
-  ArrayRef<int64_t> dmaSizes;
-  if (auto dmaSizesAttr = target.getWgp().getDmaSizes()) {
-    dmaSizes = dmaSizesAttr.asArrayRef();
-  }
-
-  int64_t minElementsPerTransfer = std::numeric_limits<int64_t>::max();
-  for (int64_t dmaSize : dmaSizes) {
-    if (dmaSize % elementBits != 0) {
-      continue;
-    }
-    int64_t elementsPerLane = dmaSize / elementBits;
-    int64_t elementsPerTransfer = *subgroupSize * elementsPerLane;
-    minElementsPerTransfer =
-        std::min(minElementsPerTransfer, elementsPerTransfer);
-  }
-
-  if (minElementsPerTransfer == std::numeric_limits<int64_t>::max() ||
-      availableElements % minElementsPerTransfer != 0) {
-    return std::nullopt;
-  }
-
-  return subgroupSize;
-}
-
 /// Returns the minimum number of elements needed (after padding) for DMA
 /// alignment, or std::nullopt if DMA is not supported for this element type.
 static std::optional<int64_t>
@@ -265,6 +224,18 @@ getMinDMAAlignedElements(FunctionOpInterface funcOp, Type elementType) {
     return std::nullopt;
   }
   return minElementsPerTransfer;
+}
+
+/// Returns the subgroup size if the available elements are aligned to DMA
+/// transfer sizes, std::nullopt otherwise.
+static std::optional<int64_t>
+getDMAAlignedSubgroupSize(FunctionOpInterface funcOp, Type elementType,
+                          int64_t availableElements) {
+  auto minAligned = getMinDMAAlignedElements(funcOp, elementType);
+  if (!minAligned || availableElements % *minAligned != 0) {
+    return std::nullopt;
+  }
+  return getSubgroupSize(funcOp);
 }
 
 /// Helper to compute thread number of threads based on translation_info.
@@ -332,25 +303,22 @@ static bool isCopyDMAConvertible(linalg::CopyOp copyOp) {
     availableElements = ShapedType::getNumElements(shape);
   }
 
-  // Check if already aligned.
-  if (getDMAAlignedSubgroupSize(funcOp, outputType.getElementType(),
-                                availableElements)
-          .has_value()) {
-    return true;
-  }
-
-  // Check if padding can bring it to alignment.
   auto minAligned =
       getMinDMAAlignedElements(funcOp, outputType.getElementType());
   if (!minAligned) {
     return false;
   }
 
-  // Padding is feasible: we can round up the outermost dimension.
+  // Already aligned.
+  if (availableElements % *minAligned == 0) {
+    return true;
+  }
+
+  // Check if padding can bring it to alignment.
   int64_t paddedTotal =
       llvm::divideCeil(availableElements, *minAligned) * *minAligned;
   // Sanity: padding shouldn't more than double the allocation.
-  return paddedTotal <= 2 * availableElements || availableElements == 0;
+  return paddedTotal <= 2 * availableElements;
 }
 
 /// Check if the given forall op has warp mapping.
@@ -747,14 +715,8 @@ static linalg::CopyOp padCopyForDMA(linalg::CopyOp copyOp,
   highPadValues[0] = rewriter.getIndexAttr(highPad);
 
   Value source = copyOp.getInputs()[0];
-  Value padValue;
-  if (isa<FloatType>(elemType)) {
-    padValue = arith::ConstantOp::create(rewriter, loc,
-                                         rewriter.getFloatAttr(elemType, 0.0));
-  } else {
-    padValue = arith::ConstantOp::create(rewriter, loc,
-                                         rewriter.getIntegerAttr(elemType, 0));
-  }
+  Value padValue =
+      arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(elemType));
 
   auto paddedSrcType = RankedTensorType::get(paddedShape, elemType);
   Value paddedSource = tensor::PadOp::create(
@@ -1084,14 +1046,12 @@ struct GPUConvertToCoalescedDMAPass final
       }
     });
 
-    if (!dmaCopies.empty()) {
-      for (linalg::CopyOp copyOp : dmaCopies) {
-        if (!isCopyDMAConvertible(copyOp)) {
-          LLVM_DEBUG(llvm::dbgs()
-                     << "DMA pre-check: downgrading non-convertible copy\n");
-          setLoweringConfig(copyOp,
-                            IREE::GPU::DerivedThreadConfigAttr::get(context));
-        }
+    for (linalg::CopyOp copyOp : dmaCopies) {
+      if (!isCopyDMAConvertible(copyOp)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "DMA pre-check: downgrading non-convertible copy\n");
+        setLoweringConfig(copyOp,
+                          IREE::GPU::DerivedThreadConfigAttr::get(context));
       }
     }
 
