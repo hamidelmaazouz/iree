@@ -11,6 +11,7 @@
 #include "mlir/Support/LogicalResult.h"
 
 namespace mlir {
+class Block;
 class Location;
 class OpBuilder;
 class Operation;
@@ -157,6 +158,19 @@ getCloneableOps(Flow::DispatchRegionOp regionOp,
 LogicalResult cloneProducersToRegion(RewriterBase &rewriter,
                                      Flow::DispatchRegionOp regionOp,
                                      CloneableIntoDispatchOptions options = {});
+
+/// Returns true if moving `values` to `insertionPoint` would strand an
+/// external user before the dispatch.
+///
+/// This is illegal when the user is itself a dispatch region or when moving it
+/// after the dispatch would create a cycle through the group's dependencies.
+///
+/// `sliceBoundary` limits dependency discovery to ops that would move with the
+/// group. `isInGroup(op)` excludes users that are already part of that group.
+bool hasUnmovableUse(Block *block, Operation *insertionPoint,
+                     Operation *sliceBoundary, ValueRange values,
+                     ArrayRef<Operation *> groupSeeds,
+                     function_ref<bool(Operation *)> isInGroup);
 
 } // namespace mlir::iree_compiler::IREE::Flow
 
