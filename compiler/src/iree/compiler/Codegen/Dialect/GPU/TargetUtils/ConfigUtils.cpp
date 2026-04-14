@@ -337,32 +337,42 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
         continue;
       }
 
-      auto [mSize, nSize, kSize] = mma.getMNKShape();
       auto [aType, bType, cType] = mma.getABCElementTypes();
-      intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
+      // Only group convolutions show a clear gain from block intrinsics.
+      if (mma.isBlockIntrinsic() && isGemm) {
+        continue;
+      }
+      if (mma.isBlockIntrinsic()) {
+        auto [bSize, mSize, nSize, kSize] = mma.getBMNKShape();
+        intrinsics.emplace_back(GPUIntrinsicType(mSize, nSize, kSize, bSize,
+                                                 aType, bType, cType, mma));
+      } else {
+        auto [mSize, nSize, kSize] = mma.getMNKShape();
+        intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
 
-      // Derive VDMFMA virtual intrinsics from this concrete MMA. VDMFMAs
-      // use the sparse trick (smfmac) and are only efficient when the
-      // problem's M dimension fits within the VDMFMA's M tile size (8).
-      // Without the M-size guard below, compareIntrinsics would prefer
-      // VDMFMA for all M sizes due to its larger intrinsic area
-      // ((8+16)*64=1536 vs (16+16)*16=512), which is incorrect for M>8.
-      //
-      // Note: VMFMA intrinsics are intentionally excluded here. Adding
-      // them would change MMA selection for all problems (VMFMA's larger
-      // area wins over concrete MFMA in compareIntrinsics). That should
-      // be a separate change with benchmarking.
-      for (VirtualMMAIntrinsic vi : mma.getVirtualIntrinsics()) {
-        if (!isVDMFMAIntrinsic(vi)) {
-          continue;
+        // Derive VDMFMA virtual intrinsics from this concrete MMA. VDMFMAs
+        // use the sparse trick (smfmac) and are only efficient when the
+        // problem's M dimension fits within the VDMFMA's M tile size (8).
+        // Without the M-size guard below, compareIntrinsics would prefer
+        // VDMFMA for all M sizes due to its larger intrinsic area
+        // ((8+16)*64=1536 vs (16+16)*16=512), which is incorrect for M>8.
+        //
+        // Note: VMFMA intrinsics are intentionally excluded here. Adding
+        // them would change MMA selection for all problems (VMFMA's larger
+        // area wins over concrete MFMA in compareIntrinsics). That should
+        // be a separate change with benchmarking.
+        for (VirtualMMAIntrinsic vi : mma.getVirtualIntrinsics()) {
+          if (!isVDMFMAIntrinsic(vi)) {
+            continue;
+          }
+          auto vmma = VirtualMMAAttr::get(ctx, vi);
+          auto [vm, vn, vk] = vmma.getMNKShape();
+          if (problem.mSizes.empty() || problem.mSizes.back() > vm) {
+            continue;
+          }
+          auto [va, vb, vc] = vmma.getABCElementTypes();
+          intrinsics.emplace_back(vm, vn, vk, va, vb, vc, vmma);
         }
-        auto vmma = VirtualMMAAttr::get(ctx, vi);
-        auto [vm, vn, vk] = vmma.getMNKShape();
-        if (problem.mSizes.empty() || problem.mSizes.back() > vm) {
-          continue;
-        }
-        auto [va, vb, vc] = vmma.getABCElementTypes();
-        intrinsics.emplace_back(vm, vn, vk, va, vb, vc, vmma);
       }
     }
   }
@@ -871,7 +881,8 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
   // Use the batch tile sizes computed by the heuristic. When both M and
   // N sizes are smaller than the intrinsic sizes and must be padded up to
   // them, tiling batch elements per workgroup may help amortize the
-  // padding overhead.
+  // padding overhead. Additionally, if block intrinsics are available,
+  // the subgroup is tiled to match the intrinsic's batch dimension.
   int64_t staticBatchIdx = 0;
   for (unsigned batch : contractionB) {
     if (ShapedType::isDynamic(bounds[batch])) {
@@ -879,6 +890,12 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     } else {
       workgroupTileSizes[batch] =
           schedule->workgroupBatchSizes[staticBatchIdx++];
+    }
+    // If we are using block intrinsics, then we set the subgroup tile to 1
+    // in that dimension as we always use one tile in heuristic.
+    if (batch == contractionB[contractionB.size() - 1] &&
+        !schedule->batchSizes.empty()) {
+      subgroupTileSizes[batch] = 1;
     }
   }
 
